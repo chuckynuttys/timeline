@@ -3,6 +3,7 @@
   import Timeline from './lib/Timeline.svelte';
   import ActivityPool from './lib/ActivityPool.svelte';
   import ActivityManager from './lib/ActivityManager.svelte';
+  import Stats from './lib/Stats.svelte';
   import { loadStore, startupCatchUp } from './lib/store.svelte';
 
   /** No pane may be dragged below this many pixels on the split axis. */
@@ -179,7 +180,9 @@
 
     <section class="panel pane-bottom cell-br">
       <header class="panel-header">Stats</header>
-      <div class="panel-body placeholder">Stats coming soon</div>
+      <div class="panel-body">
+        <Stats />
+      </div>
     </section>
   </div>
 </main>

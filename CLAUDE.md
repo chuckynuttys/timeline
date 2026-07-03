@@ -73,9 +73,16 @@ npm run check                                          # svelte-check + tsc — 
   trust the connection's `foreign_keys` pragma even though the FKs are CASCADE);
   `restoreActivitySnapshot` is its inverse (re-inserts with original ids) for
   the pool's shift-click undo. **`completeBlock(block)` is the SINGLE write site
-  for time_entries** — see the ledger invariant below. Read helpers for the
-  (unbuilt) stats panel: `getTotalsByTrack()`, `getTotalsByActivity()` (SUM
-  grouped, aliased `seconds`), `getTimeEntries({since?,until?})` (raw rows).
+  for time_entries** — see the ledger invariant below. Read helpers: legacy
+  `getTotalsByTrack()`/`getTotalsByActivity()` (SUM grouped) +
+  `getTimeEntries({since?,until?})`, and **`getStats(filter)` — THE stats
+  aggregation entry point** (read-only). One JOIN'd pass over time_entries
+  filtered by `{since?, until?, trackIds?, activityIds?}` (empty/absent array =
+  no filter on that axis) returns `grandTotalSeconds`, `completedCount`,
+  `trackTotals`/`activityTotals` (names+colors LEFT-JOINed, deleted → "(deleted)"
+  / gray `#6b7280`, sorted DESC), and `dailyTotals` (one bucket per LOCAL day
+  across the range, zero days included; `perTrack` seconds for the trend). Day
+  bucketing is local-midnight (matches the timeline).
 - `src-tauri/src/lib.rs` — plugin registration, tray, and **sqlx migrations**
   (v1 base tables, v2 tracks + block track_id, v3 eligibility +
   time_entries.track_id, v4 time_entries.source_block_id + partial unique
@@ -285,7 +292,24 @@ npm run check                                          # svelte-check + tsc — 
   end passes, inserting exactly ONE fresh row (INSERT OR IGNORE + unique index).
   **HARD INVARIANT (verified via CDP): complete→uncomplete→complete nets exactly
   ONE ledger row — never two, never zero.** `store.ledgerVersion` is a bump
-  counter signalling any ledger change for the (future) stats panel to re-query.
+  counter signalling any ledger change; the stats panel `$effect`s on it to
+  re-query live (no polling).
+- `lib/Stats.svelte` — the BR-quadrant STATS panel (read-only). Range selector
+  (Today | This week | Last 7 days | All time; range persists in
+  `timeline.stats-range.v1`, filters are session-only, all-on each launch) +
+  summary cards (total / completed count / top track), two rows of toggle CHIPS
+  (excluded = the OFF set; empty = no filter), ranked BY-TRACK and BY-ACTIVITY
+  bars (zero rows hidden), and a hand-rolled stacked-bar TREND svg (viewBox
+  0–100, `preserveAspectRatio=none`, one column per local day, today highlighted,
+  `<title>` hover). **Activity chips are SCOPED by the track filter** — an
+  activity shows only while ≥1 of its eligible tracks is included, so turning a
+  track off hides & deactivates its activities. Everything reflects the combined
+  range+track+activity filter via one `getStats` call (Today does a 2nd call for
+  a 7-day trend; All time caps the trend to the last 30 days). Refreshes on
+  `store.ledgerVersion` / range / filter / entity changes.
+- `lib/format.ts` — **THE single `formatDuration`** (minute-rounded, compact:
+  "4h 30m" / "2h 5m" / "38m" / "0m"). Shared by the timeline (block labels,
+  resize badge) and Stats so the two never drift.
 - Completion side effects (notification + sound) fire ONLY from the live tick,
   ONE per newly-completed block. Startup catch-up (`startupCatchUp`, gated
   before the live tick via `store.reconciled`) logs blocks that ended while
@@ -298,7 +322,7 @@ Overlapping blocks in the same track now auto-expand into derived sub-lanes
 right-click (on a pool chip = context-menu Delete removes the activity + its
 blocks; on a placed block = delete that one block immediately).
 The completion-logging engine is built (blocks complete → gray + notif + sound +
-one time_entries row; catch-up on launch). Remaining, not yet built: the STATS
-panel (BR quadrant) reading `getTotalsByTrack`/`getTotalsByActivity`/
-`getTimeEntries`; the avatar (BL); tray behaviors (close-to-tray). Wait for the
-user's phase prompt before starting these.
+one time_entries row; catch-up on launch). The STATS panel (BR quadrant) is built
+(`lib/Stats.svelte` on `getStats`). Remaining, not yet built: the avatar (BL);
+tray behaviors (close-to-tray). Wait for the user's phase prompt before starting
+these.

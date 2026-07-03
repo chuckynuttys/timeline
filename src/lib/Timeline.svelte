@@ -19,6 +19,7 @@
     clampTimeScale,
   } from './view.svelte';
   import { computeGeometry } from './lane-geometry';
+  import { formatDuration } from './format';
   import {
     store,
     dragUI,
@@ -1176,14 +1177,6 @@
         interact(node).unset();
       },
     };
-  }
-
-  function formatDuration(seconds: number): string {
-    const minutes = Math.round(seconds / 60);
-    const h = Math.floor(minutes / 60);
-    const m = minutes % 60;
-    if (h === 0) return `${m} min`;
-    return m === 0 ? `${h} h` : `${h} h ${m} min`;
   }
 
   /** Wall-clock HH:MM of an epoch-ms time (for a block's finish time). */

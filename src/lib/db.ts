@@ -64,6 +64,62 @@ export interface EligibilityRow {
   track_id: number;
 }
 
+/* ---- stats aggregation (read-only; never touches the logging engine) ------- */
+
+export interface StatsFilter {
+  /** Inclusive lower / exclusive upper bound on logged_at (epoch ms). */
+  since?: number;
+  until?: number;
+  /** Empty or absent array = no filter on that dimension. */
+  trackIds?: number[];
+  activityIds?: number[];
+}
+
+export interface TrackStat {
+  track_id: number | null; // null = the row's track was deleted
+  name: string;
+  color: string;
+  seconds: number;
+}
+
+export interface ActivityStat {
+  activity_id: number;
+  name: string;
+  color: string;
+  seconds: number;
+}
+
+export interface DailyTotal {
+  /** Local-midnight epoch of the day (matches the timeline's local-date logic). */
+  dayStart: number;
+  perTrack: { track_id: number | null; seconds: number }[];
+}
+
+export interface Stats {
+  grandTotalSeconds: number;
+  completedCount: number;
+  trackTotals: TrackStat[]; // sorted DESC by seconds
+  activityTotals: ActivityStat[]; // sorted DESC by seconds
+  dailyTotals: DailyTotal[]; // one bucket per local day across the range
+}
+
+/** Neutral treatment for a ledger row whose track/activity was deleted. */
+const DELETED_NAME = '(deleted)';
+const DELETED_COLOR = '#6b7280';
+
+/** Local midnight epoch of a timestamp — the day bucket key. */
+function localDayStart(t: number): number {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+/** Next local midnight (via calendar arithmetic, so DST days stay whole). */
+function nextLocalDay(dayStart: number): number {
+  const d = new Date(dayStart);
+  d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
 let dbPromise: Promise<Database> | null = null;
 
 /**
@@ -524,4 +580,119 @@ export async function getTimeEntries(
     `SELECT * FROM time_entries ${where} ORDER BY logged_at`,
     params,
   );
+}
+
+/**
+ * THE single stats aggregation entry point. One JOIN'd pass over time_entries
+ * (filtered by range + track/activity arrays) yields every view the panel needs:
+ * grand total, completed count, per-track and per-activity totals (names/colors
+ * JOINed, deleted entities degraded to "(deleted)"/gray, sorted DESC), and a
+ * per-local-day trend covering the range (zero days included so gaps show).
+ * Read-only — it never writes the ledger or schema.
+ */
+export async function getStats(filter: StatsFilter = {}): Promise<Stats> {
+  const db = await getDb();
+  const clauses: string[] = [];
+  const params: number[] = [];
+  const add = (v: number) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+  if (filter.since !== undefined) clauses.push(`te.logged_at >= ${add(filter.since)}`);
+  if (filter.until !== undefined) clauses.push(`te.logged_at < ${add(filter.until)}`);
+  if (filter.trackIds && filter.trackIds.length)
+    clauses.push(`te.track_id IN (${filter.trackIds.map(add).join(', ')})`);
+  if (filter.activityIds && filter.activityIds.length)
+    clauses.push(`te.activity_id IN (${filter.activityIds.map(add).join(', ')})`);
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  const rows = await db.select<
+    Array<{
+      seconds: number;
+      logged_at: number;
+      track_id: number | null;
+      activity_id: number;
+      track_name: string | null;
+      track_color: string | null;
+      activity_name: string | null;
+      activity_color: string | null;
+    }>
+  >(
+    `SELECT te.seconds AS seconds, te.logged_at AS logged_at,
+            te.track_id AS track_id, te.activity_id AS activity_id,
+            tr.name AS track_name, tr.color AS track_color,
+            ac.name AS activity_name, ac.color AS activity_color
+     FROM time_entries te
+     LEFT JOIN tracks tr ON tr.id = te.track_id
+     LEFT JOIN activities ac ON ac.id = te.activity_id
+     ${where}`,
+    params,
+  );
+
+  let grandTotalSeconds = 0;
+  const trackMap = new Map<number | null, TrackStat>();
+  const activityMap = new Map<number, ActivityStat>();
+  // day -> (track_id -> seconds)
+  const dayMap = new Map<number, Map<number | null, number>>();
+
+  for (const r of rows) {
+    grandTotalSeconds += r.seconds;
+
+    let ts = trackMap.get(r.track_id);
+    if (!ts) {
+      ts = {
+        track_id: r.track_id,
+        name: r.track_name ?? DELETED_NAME,
+        color: r.track_color ?? DELETED_COLOR,
+        seconds: 0,
+      };
+      trackMap.set(r.track_id, ts);
+    }
+    ts.seconds += r.seconds;
+
+    let as = activityMap.get(r.activity_id);
+    if (!as) {
+      as = {
+        activity_id: r.activity_id,
+        name: r.activity_name ?? DELETED_NAME,
+        color: r.activity_color ?? DELETED_COLOR,
+        seconds: 0,
+      };
+      activityMap.set(r.activity_id, as);
+    }
+    as.seconds += r.seconds;
+
+    const day = localDayStart(r.logged_at);
+    let perTrack = dayMap.get(day);
+    if (!perTrack) dayMap.set(day, (perTrack = new Map()));
+    perTrack.set(r.track_id, (perTrack.get(r.track_id) ?? 0) + r.seconds);
+  }
+
+  // Fill every local day across the range so the trend shows gaps as zero
+  // columns. Range end = until-1 (until is exclusive) or now; start = since or
+  // the earliest logged day (or today when nothing matched).
+  const now = Date.now();
+  const endDay = localDayStart(filter.until !== undefined ? filter.until - 1 : now);
+  const earliest = rows.length
+    ? Math.min(...rows.map((r) => r.logged_at))
+    : now;
+  const startDay = localDayStart(filter.since ?? earliest);
+  const dailyTotals: DailyTotal[] = [];
+  for (let day = startDay; day <= endDay; day = nextLocalDay(day)) {
+    const perTrack = dayMap.get(day);
+    dailyTotals.push({
+      dayStart: day,
+      perTrack: perTrack
+        ? [...perTrack].map(([track_id, seconds]) => ({ track_id, seconds }))
+        : [],
+    });
+  }
+
+  return {
+    grandTotalSeconds,
+    completedCount: rows.length, // one ledger row per completed block
+    trackTotals: [...trackMap.values()].sort((a, b) => b.seconds - a.seconds),
+    activityTotals: [...activityMap.values()].sort((a, b) => b.seconds - a.seconds),
+    dailyTotals,
+  };
 }
