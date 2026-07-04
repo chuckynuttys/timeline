@@ -4,6 +4,7 @@
   import ActivityPool from './lib/ActivityPool.svelte';
   import ActivityManager from './lib/ActivityManager.svelte';
   import Stats from './lib/Stats.svelte';
+  import AvatarPanel from './lib/AvatarPanel.svelte';
   import { loadStore, startupCatchUp } from './lib/store.svelte';
 
   /** No pane may be dragged below this many pixels on the split axis. */
@@ -148,7 +149,9 @@
 
     <section class="panel pane-bottom cell-bl">
       <header class="panel-header">Avatar</header>
-      <div class="panel-body placeholder">Avatar goes here</div>
+      <div class="panel-body">
+        <AvatarPanel />
+      </div>
     </section>
   </div>
 
@@ -248,13 +251,6 @@
     min-width: 0;
     min-height: 0;
     overflow: hidden;
-  }
-
-  .placeholder {
-    display: grid;
-    place-items: center;
-    color: #6f6f6f;
-    font-size: 0.9rem;
   }
 
   .splitter {

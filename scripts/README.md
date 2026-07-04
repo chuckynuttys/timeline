@@ -25,6 +25,7 @@ Without the env var the scripts fail at `http://127.0.0.1:9222/json`.
 | `console.mjs` | Hard-reloads the page, dumps console errors/exceptions and a DOM sanity summary. **Run this after big component restructures** — Vite HMR can leave the page in a broken half-state that only a reload clears. |
 | `inspect-db.cjs <path-to-db>` | Lists tables + activities + row counts via `node:sqlite` (read-only; safe while the app runs). DB lives at `%APPDATA%\com.chardoh.timeline\timeline.db`. |
 | `example-ui-test.mjs` | Worked example: reloads, picks a *visible, hit-testable* block, does a cross-lane drag, then a chip drop into a lane, asserting on resulting styles. Copy this pattern for new interaction tests. |
+| `sanitize-glb.mjs <file.glb>` | Fixes Unity glTFast exports whose nodes declare `skin` over meshes with no JOINTS_0/WEIGHTS_0 (three's `normalizeSkinWeights` crashes with "reading 'count'"). Strips the bogus skin refs in place. **Run on any re-exported avatar model before dropping it into `public/models/`.** |
 
 ## Hard-won gotchas
 

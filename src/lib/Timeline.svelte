@@ -753,7 +753,10 @@
       completeDue(currentTime)
         .then((done) => {
           for (const block of done) announceCompletion(block);
-          if (done.length > 0) logStatsSnapshot();
+          if (done.length > 0) {
+            logStatsSnapshot();
+            store.liveCompletionVersion++; // avatar reaction — LIVE only
+          }
         })
         .catch((e) => console.error('completion detection failed', e))
         .finally(() => {

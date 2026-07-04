@@ -40,6 +40,10 @@ export const store = $state({
   /** Bumped on any time_entries change (completion / uncompletion) — a refresh
    *  signal for the (future) stats panel to re-query totals. */
   ledgerVersion: 0,
+  /** Bumped ONLY on live completions (the notification path in Timeline's 1s
+   *  tick, gated on `reconciled`) — never by startup catch-up or uncompletion.
+   *  The avatar reacts to this; it must stay a superficial read-only signal. */
+  liveCompletionVersion: 0,
 });
 
 /**

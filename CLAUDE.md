@@ -310,6 +310,60 @@ npm run check                                          # svelte-check + tsc — 
 - `lib/format.ts` — **THE single `formatDuration`** (minute-rounded, compact:
   "4h 30m" / "2h 5m" / "38m" / "0m"). Shared by the timeline (block labels,
   resize badge) and Stats so the two never drift.
+- `lib/AvatarPanel.svelte` — the BL-quadrant avatar (three.js, imperative, no
+  wrapper libs; `three` + `@types/three` deps). Loads `/models/reika.glb`
+  (Vite-static from `public/models/` — the app NEVER reads Downloads) with
+  GLTFLoader. **Framing:** height-fit around two consts — `FRAME_FILL` (0.9 =
+  subject occupies 90% of the vertical view; distance = (targetH/2)/tan(vFov/2)
+  /FILL) and `FRAME_TARGET` ('full' | 'upper' = hips-up, top half of the box);
+  width gets its own exact fit and the LARGER distance wins so the head never
+  crops in narrow panels; slight downward angle. **The frame box comes from
+  BONE world positions after `mixer.update(0)`** (padded 5% of height for
+  flesh/hair — no big safety factors), falling back to Box3 for unrigged
+  models — Unity exports can bind the mesh far off-origin while the animation
+  snaps the skeleton to the origin, and Box3.setFromObject ignores skinning,
+  so framing the bind pose aims at empty space. **Resize (flicker-free):**
+  renderer.setSize() BLANKS the drawing buffer, so every ResizeObserver event
+  does setSize(w,h,false) + aspect + ONE SYNCHRONOUS renderer.render() in the
+  same callback (never present a blank frame; gated on !document.hidden);
+  the reframe is DEBOUNCED (~120ms) to one settle pass; guards: skip <2px and
+  unchanged sizes; NOTHING (renderer/canvas/materials) is recreated on resize.
+  Transparent
+  renderer (alpha, clear-alpha 0, SRGBColorSpace, dpr capped at 2), ambient +
+  one key light (two intensity consts at top). **FULLY ISOLATED:** any load or
+  init failure → console.warn + "avatar unavailable" overlay, never a crash;
+  the canvas stays in the DOM (only hidden) so the GL context is never yanked.
+  OWN rAF loop, paused on `visibilitychange` hidden (Clock gap is swallowed on
+  resume so the mixer doesn't fast-forward); full onDestroy disposal
+  (geometries, materials, textures, renderer). Animation: idle clip
+  (case-insensitive) else first, LoopRepeat; clip names console.info'd once;
+  `playClip(name,{loop})` with 0.3s crossfades + `returnToIdle()`; mixer
+  'finished' returns one-shots to idle. Idle pick: exact "idle" →
+  name-contains "idle" → first clip. Reacts to `store.liveCompletionVersion`
+  (LIVE completions only — bumped next to the notification in Timeline's tick,
+  so catch-up can't trigger it) by playing the first clip whose name contains
+  wave/dance/cheer/jump, once. Current reika.glb (UnityGltf 2.19.5, ~100 MB)
+  has ONE clip, `KA_Idle01_breathing`, and faces the camera (orientation is
+  export-dependent — if a re-export faces away, set `rotation.y = Math.PI` at
+  the noted spot). No celebration clip yet, so completions don't animate.
+  Re-exported models MUST be run through `scripts/sanitize-glb.mjs` (glTFast
+  puts `skin` on weightless accessory meshes → three crashes on "reading
+  'count'"; the UnityGltf exporter doesn't have this bug). Uses `THREE.Timer`
+  (Clock is deprecated in r185); `timer.reset()` on resume swallows the
+  hidden-time gap. **Orbit camera:** OrbitControls on the CANVAS only (drag =
+  rotate, wheel = dolly; pan DISABLED; polar clamped 15–95° so never under the
+  floor/overhead; damping 0.08 → `controls.update()` every rAF tick). Home view
+  = `goHome()`: auto-frame, then controls.target = box center and dolly clamps
+  [0.35, 3]×framedDistance. **Camera ownership:** any interaction fires the
+  controls' 'start' event → `userAdjusted = true` → resize updates ONLY
+  aspect/projection + sync render (no reframe snap-back); a fresh panel keeps
+  the debounced auto-reframe; double-click on the canvas = goHome (clears the
+  flag). Height-fit framing is aspect-height-INVARIANT by design — a fresh
+  reframe only moves the camera when width binds (panel aspect < ~0.33 for
+  reika). Canvas wheel stopPropagation()s so the 4th wheel surface never
+  chains to ancestors; splitters use pointer capture so drags never reach the
+  canvas (verified). Dev-only `window.__avatarDebug` (camPos/target/dist/
+  clamps/userAdjusted) backs the CDP verification scripts.
 - Completion side effects (notification + sound) fire ONLY from the live tick,
   ONE per newly-completed block. Startup catch-up (`startupCatchUp`, gated
   before the live tick via `store.reconciled`) logs blocks that ended while
@@ -323,6 +377,8 @@ right-click (on a pool chip = context-menu Delete removes the activity + its
 blocks; on a placed block = delete that one block immediately).
 The completion-logging engine is built (blocks complete → gray + notif + sound +
 one time_entries row; catch-up on launch). The STATS panel (BR quadrant) is built
-(`lib/Stats.svelte` on `getStats`). Remaining, not yet built: the avatar (BL);
-tray behaviors (close-to-tray). Wait for the user's phase prompt before starting
-these.
+(`lib/Stats.svelte` on `getStats`). The AVATAR panel (BL quadrant) is built
+(`lib/AvatarPanel.svelte`, three.js) and plays the idle breathing loop; a
+celebration clip (wave/dance/cheer/jump) awaits a future re-export. Remaining,
+not yet built: tray behaviors (close-to-tray). Wait for the user's phase prompt
+before starting these.

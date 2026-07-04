@@ -15,6 +15,7 @@
     "@tauri-apps/cli": "^2.11.4",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^24.13.2",
+    "@types/three": "^0.185.0",
     "svelte": "^5.56.4",
     "svelte-check": "^4.7.1",
     "typescript": "~6.0.2",
@@ -24,6 +25,7 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-sql": "^2.4.0",
-    "interactjs": "^1.10.27"
+    "interactjs": "^1.10.27",
+    "three": "^0.185.1"
   }
 }
