@@ -351,8 +351,9 @@ npm run check                                          # svelte-check + tsc — 
   'count'"; the UnityGltf exporter doesn't have this bug). Uses `THREE.Timer`
   (Clock is deprecated in r185); `timer.reset()` on resume swallows the
   hidden-time gap. **Orbit camera:** OrbitControls on the CANVAS only (drag =
-  rotate, wheel = dolly; pan DISABLED; polar clamped 15–95° so never under the
-  floor/overhead; damping 0.08 → `controls.update()` every rAF tick). Home view
+  rotate, wheel = dolly; pan DISABLED; polar clamped 15–160° — never directly
+  overhead, but low under-model angles allowed; damping 0.08 →
+  `controls.update()` every rAF tick). Home view
   = `goHome()`: auto-frame, then controls.target = box center and dolly clamps
   [0.35, 3]×framedDistance. **Camera ownership:** any interaction fires the
   controls' 'start' event → `userAdjusted = true` → resize updates ONLY
