@@ -1,7 +1,5 @@
 import Database from '@tauri-apps/plugin-sql';
-
-/** Must match the connection string the migrations are registered under in lib.rs. */
-const DB_URL = 'sqlite:timeline.db';
+import { ensureSchema, resolveActiveProfile } from './profiles';
 
 export interface Activity {
   id: number;
@@ -123,11 +121,21 @@ function nextLocalDay(dayStart: number): number {
 let dbPromise: Promise<Database> | null = null;
 
 /**
- * Shared connection. The first call runs pending migrations (the plugin
- * applies them on load) and seeds example activities if the table is empty.
+ * Shared connection to the ACTIVE PROFILE's database. The first call resolves
+ * the registry (running the one-time profile adoption if needed), opens that
+ * profile's file, builds/verifies the schema (Rust sqlx migrations only cover
+ * `sqlite:timeline.db`; profile files rely on the idempotent JS ensureSchema),
+ * and seeds example activities if the table is empty. Every query function
+ * below is unchanged — it simply operates on whichever DB is open. Switching
+ * profiles reloads the webview, so dbPromise never has to be re-pointed live.
  */
 export function getDb(): Promise<Database> {
-  dbPromise ??= Database.load(DB_URL).then(seedIfEmpty);
+  dbPromise ??= (async () => {
+    const profile = await resolveActiveProfile();
+    const db = await Database.load(`sqlite:${profile.db_file}`);
+    await ensureSchema(db);
+    return seedIfEmpty(db);
+  })();
   return dbPromise;
 }
 

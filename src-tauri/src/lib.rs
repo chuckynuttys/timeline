@@ -141,9 +141,37 @@ fn migrations() -> Vec<Migration> {
   }]
 }
 
+/// Delete a profile database file (plus its -wal/-shm siblings) from the app
+/// data dir. DELIBERATELY narrow: only `profile_<id>.db` names pass — the
+/// original timeline.db (the user's real data) can never be deleted through
+/// this, and path traversal is structurally impossible.
+#[tauri::command]
+fn delete_profile_db(app: tauri::AppHandle, file: String) -> Result<(), String> {
+  let valid = file.starts_with("profile_")
+    && file.ends_with(".db")
+    && file[8..file.len() - 3]
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric());
+  if !valid {
+    return Err(format!("refusing to delete non-profile file: {file}"));
+  }
+  let dir = app
+    .path()
+    .app_data_dir()
+    .map_err(|e| format!("no app data dir: {e}"))?;
+  for suffix in ["", "-wal", "-shm"] {
+    let path = dir.join(format!("{file}{suffix}"));
+    if path.exists() {
+      std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+  }
+  Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .invoke_handler(tauri::generate_handler![delete_profile_db])
     .plugin(
       tauri_plugin_sql::Builder::default()
         .add_migrations("sqlite:timeline.db", migrations())

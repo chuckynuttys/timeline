@@ -2,6 +2,90 @@
   import { store } from './store.svelte';
   import { getStats, type Stats, type DailyTotal } from './db';
   import { formatDuration } from './format';
+  import {
+    listProfiles,
+    resolveActiveProfile,
+    createProfile,
+    removeProfile,
+    switchProfile,
+    type Profile,
+  } from './profiles';
+
+  /* ---- Stats / Profiles tabs ------------------------------------------- */
+  let tab = $state<'stats' | 'profiles'>('stats');
+  let profiles = $state<Profile[]>([]);
+  let activeId = $state('');
+  let activeName = $state('');
+  /** Inline confirm state (one at a time): the profile awaiting confirmation. */
+  let pendingSwitch = $state<Profile | null>(null);
+  let pendingRemove = $state<Profile | null>(null);
+  let newName = $state('');
+  let profileError = $state('');
+
+  async function refreshProfiles() {
+    try {
+      const active = await resolveActiveProfile();
+      activeId = active.id;
+      activeName = active.name;
+      profiles = await listProfiles();
+    } catch (e) {
+      console.error('profiles: refresh failed', e);
+    }
+  }
+  // Load once at mount (profile set only changes through this tab's own
+  // actions, which call refreshProfiles explicitly; switching reloads anyway).
+  refreshProfiles();
+
+  function askSwitch(p: Profile) {
+    if (p.id === activeId) return;
+    pendingRemove = null;
+    pendingSwitch = p;
+  }
+
+  async function confirmSwitch() {
+    if (!pendingSwitch) return;
+    try {
+      await switchProfile(pendingSwitch.id); // writes registry + reloads
+    } catch (e) {
+      profileError = `Switch failed: ${e}`;
+    }
+  }
+
+  async function addProfile() {
+    const name = newName.trim();
+    if (!name) return;
+    if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
+      profileError = `A profile named "${name}" already exists`;
+      return;
+    }
+    profileError = '';
+    try {
+      const created = await createProfile(name);
+      newName = '';
+      await refreshProfiles();
+      pendingSwitch = created; // same reload confirm as clicking a row
+    } catch (e) {
+      profileError = `Create failed: ${e}`;
+    }
+  }
+
+  function askRemove(p: Profile) {
+    if (p.id === activeId || profiles.length <= 1) return;
+    pendingSwitch = null;
+    pendingRemove = p;
+  }
+
+  async function confirmRemove() {
+    if (!pendingRemove) return;
+    profileError = '';
+    try {
+      await removeProfile(pendingRemove.id);
+      pendingRemove = null;
+      await refreshProfiles();
+    } catch (e) {
+      profileError = `Remove failed: ${e}`;
+    }
+  }
 
   type RangeKey = 'today' | 'week' | '7days' | 'all';
   const RANGES: { key: RangeKey; label: string }[] = [
@@ -184,6 +268,73 @@
 </script>
 
 <div class="stats">
+  <!-- Tab bar: Stats | Profiles, with the ACTIVE PROFILE always visible on the
+       right (critical when one profile is named Test). -->
+  <div class="tabs">
+    <button class="tab" class:active={tab === 'stats'} onclick={() => (tab = 'stats')}>
+      Stats
+    </button>
+    <button class="tab" class:active={tab === 'profiles'} onclick={() => (tab = 'profiles')}>
+      Profiles
+    </button>
+    <span class="active-profile" title="Active profile">{activeName}</span>
+  </div>
+
+  {#if tab === 'profiles'}
+    <div class="profile-list">
+      {#each profiles as p (p.id)}
+        <div class="profile-row" class:current={p.id === activeId}>
+          <button
+            class="profile-name"
+            disabled={p.id === activeId}
+            onclick={() => askSwitch(p)}
+            title={p.id === activeId ? 'This is the active profile' : `Switch to ${p.name}`}
+          >
+            {p.name}
+            {#if p.id === activeId}<span class="current-mark">(current)</span>{/if}
+          </button>
+          <button
+            class="remove"
+            disabled={p.id === activeId || profiles.length <= 1}
+            title={p.id === activeId
+              ? 'switch away first'
+              : profiles.length <= 1
+                ? 'cannot remove the last profile'
+                : `Remove ${p.name}`}
+            onclick={() => askRemove(p)}>✕</button
+          >
+        </div>
+        {#if pendingSwitch?.id === p.id}
+          <div class="confirm">
+            <span>Switch to <strong>{p.name}</strong>? The app will reload.</span>
+            <button class="confirm-yes" onclick={confirmSwitch}>Switch</button>
+            <button class="confirm-no" onclick={() => (pendingSwitch = null)}>Cancel</button>
+          </div>
+        {/if}
+        {#if pendingRemove?.id === p.id}
+          <div class="confirm danger">
+            <span>Delete profile <strong>{p.name}</strong>? Its data is permanently deleted.</span>
+            <button class="confirm-del" onclick={confirmRemove}>Delete</button>
+            <button class="confirm-no" onclick={() => (pendingRemove = null)}>Cancel</button>
+          </div>
+        {/if}
+      {/each}
+
+      <form
+        class="add-row"
+        onsubmit={(e) => {
+          e.preventDefault();
+          addProfile();
+        }}
+      >
+        <input class="add-input" placeholder="New profile name" bind:value={newName} />
+        <button class="add-btn" type="submit" disabled={!newName.trim()}>Add</button>
+      </form>
+      {#if profileError}
+        <div class="profile-error">{profileError}</div>
+      {/if}
+    </div>
+  {:else}
   <!-- HEADER: range selector + summary cards -->
   <div class="ranges">
     {#each RANGES as r (r.key)}
@@ -325,9 +476,178 @@
       </svg>
     </section>
   {/if}
+  {/if}
 </div>
 
 <style>
+  /* tab bar */
+  .tabs {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-bottom: 1px solid #333;
+    padding-bottom: 0.4rem;
+  }
+  .tab {
+    padding: 0.25rem 0.7rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: #9a9a9a;
+    cursor: pointer;
+  }
+  .tab:hover {
+    color: #cfcfcf;
+  }
+  .tab.active {
+    background: #2e2e2e;
+    color: #f0f0f0;
+  }
+  .active-profile {
+    margin-left: auto;
+    font-size: 0.7rem;
+    color: #8a8a8a;
+    padding-right: 0.25rem;
+  }
+
+  /* profiles tab */
+  .profile-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-width: 26rem;
+  }
+  .profile-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: #242424;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 0.15rem 0.3rem 0.15rem 0.6rem;
+  }
+  .profile-row.current {
+    border-color: #3b6ea5;
+  }
+  .profile-name {
+    flex: 1;
+    text-align: left;
+    background: none;
+    border: none;
+    color: #e8e8e8;
+    font-size: 0.85rem;
+    padding: 0.4rem 0;
+    cursor: pointer;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .profile-name:disabled {
+    cursor: default;
+  }
+  .current-mark {
+    margin-left: 0.4rem;
+    font-size: 0.7rem;
+    color: #6f9fd8;
+  }
+  .remove {
+    flex: none;
+    width: 1.6rem;
+    height: 1.6rem;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: #c95f5f;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .remove:hover:not(:disabled) {
+    background: rgba(201, 95, 95, 0.15);
+  }
+  .remove:disabled {
+    color: #4a4a4a;
+    cursor: not-allowed;
+  }
+  .confirm {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.75rem;
+    color: #cfcfcf;
+    background: #1f2733;
+    border: 1px solid #34496a;
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    flex-wrap: wrap;
+  }
+  .confirm.danger {
+    background: #2e2020;
+    border-color: #6a3434;
+  }
+  .confirm span {
+    flex: 1;
+    min-width: 0;
+  }
+  .confirm button {
+    border: none;
+    border-radius: 4px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .confirm-yes {
+    background: #3b6ea5;
+    color: #fff;
+  }
+  .confirm-del {
+    background: #a54040;
+    color: #fff;
+  }
+  .confirm-no {
+    background: #3a3a3a;
+    color: #cfcfcf;
+  }
+  .add-row {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.3rem;
+  }
+  .add-input {
+    flex: 1;
+    min-width: 0;
+    background: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    border-radius: 5px;
+    color: #e8e8e8;
+    font-size: 0.8rem;
+    padding: 0.35rem 0.5rem;
+  }
+  .add-input:focus {
+    outline: none;
+    border-color: #3b6ea5;
+  }
+  .add-btn {
+    border: none;
+    border-radius: 5px;
+    background: #3b6ea5;
+    color: #fff;
+    font-size: 0.75rem;
+    padding: 0.35rem 0.8rem;
+    cursor: pointer;
+  }
+  .add-btn:disabled {
+    background: #2c3a4a;
+    color: #7a8aa0;
+    cursor: not-allowed;
+  }
+  .profile-error {
+    font-size: 0.72rem;
+    color: #d88;
+  }
+
   .stats {
     height: 100%;
     overflow-y: auto;
