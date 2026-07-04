@@ -83,12 +83,37 @@ npm run check                                          # svelte-check + tsc — 
   / gray `#6b7280`, sorted DESC), and `dailyTotals` (one bucket per LOCAL day
   across the range, zero days included; `perTrack` seconds for the trend). Day
   bucketing is local-midnight (matches the timeline).
-- `src-tauri/src/lib.rs` — plugin registration, tray, and **sqlx migrations**
+- `src-tauri/src/lib.rs` — plugin registration, tray, **sqlx migrations**
   (v1 base tables, v2 tracks + block track_id, v3 eligibility +
   time_entries.track_id, v4 time_entries.source_block_id + partial unique
-  index). Migrations run on `Database.load` with the exact
+  index), and the `delete_profile_db` command (deletes `profile_<id>.db`
+  files ONLY — name-validated, so timeline.db can never be file-deleted).
+  Migrations run on `Database.load` with the exact
   string `sqlite:timeline.db`. SQLite gotcha: ADD COLUMN can't be NOT NULL +
   REFERENCES → rebuild-table pattern (see v2); nullable REFERENCES is fine (v3).
+- `lib/profiles.ts` — **PROFILES: one SQLite FILE per profile.** A tiny
+  registry DB (`profiles.db`: `profiles(id,name,db_file,created_at)` +
+  `registry(key,value)` for activeProfileId) is the only cross-profile state.
+  The original `timeline.db` IS the "Chardoh" profile (adopted by pointer on
+  first run — the file is never moved/renamed; the safest migration of real
+  data is the one that never touches it); later profiles live in
+  `profile_<id>.db`. First-run migration is guarded by the registry being
+  empty and also creates the "Test" profile. **Switching = write the active
+  pointer + `location.reload()`** — deliberate design: every store and the
+  startup catch-up re-initialize against the new DB; no live hot-swap. db.ts
+  `getDb()` resolves the active profile before opening, so every existing
+  query function is unchanged. **Schema for profile DBs comes from the JS
+  `ensureSchema`** (idempotent CREATE IF NOT EXISTS mirror of migrations
+  v1–v4 + the 3 starter tracks; the Rust sqlx migrations are registered per
+  connection-string and can't be dynamic) — ⚠ FUTURE SCHEMA CHANGES must land
+  in BOTH lib.rs migrations AND ensureSchema. Plugin gotcha: `db.close()`
+  WITHOUT the connection-string argument closes EVERY pool in the app — always
+  `db.close('sqlite:<file>')`. Profiles partition DATA ONLY; layout/zoom/
+  range localStorage prefs and the avatar stay device-global. Active profile
+  name is stamped into `document.title` and shown in the stats tab bar. The
+  Profiles UI (list/switch/add/remove with inline confirms; active row's ✕
+  disabled "switch away first"; last profile unremovable) is a tab in
+  Stats.svelte.
 - `lib/store.svelte.ts` — shared `$state` store (activities, tracks, blocks,
   eligibility map, `reconciled`/`catchUpLogged` completion flags) + optimistic
   mutators (`rescheduleBlock`, `resizeBlock`, `scheduleActivity`, `addTrack`,
@@ -363,8 +388,59 @@ npm run check                                          # svelte-check + tsc — 
   reframe only moves the camera when width binds (panel aspect < ~0.33 for
   reika). Canvas wheel stopPropagation()s so the 4th wheel surface never
   chains to ancestors; splitters use pointer capture so drags never reach the
-  canvas (verified). Dev-only `window.__avatarDebug` (camPos/target/dist/
-  clamps/userAdjusted) backs the CDP verification scripts.
+  canvas (verified). Dev-only `window.__avatarDebug` (camPos/target/dist/clamps/
+  userAdjusted/mode/expressions/springJoints/lookTarget/setExpression/vrmRef)
+  backs the CDP verification scripts.
+  **VRM framework (built ahead of the asset; @pixiv/three-vrm 3.x):** ONE
+  GLTFLoader with `VRMLoaderPlugin` registered handles both formats. Load chain
+  `/models/reika.vrm` → `/models/reika.glb` → warn+placeholder — dropping a
+  valid reika.vrm in switches to FULL VRM mode with zero code edits; until then
+  GLB is the daily driver. DEV override: `?avatar=/models/test.vrm` query param
+  or `DEV_FORCE_MODEL` const (test.vrm = the three-vrm VRM-1.0 sample, kept in
+  public/models for debugging; `*.vrm` is LFS-tracked). Everything downstream
+  branches on `vrm != null` (from `gltf.userData.vrm`). VRM mode:
+  `VRMUtils.removeUnnecessaryVertices` + `combineSkeletons` (3.x API),
+  `rotateVRM0` normalizes 0.x exports to the 1.0 +Z facing, `frustumCulled =
+  false` on all meshes (spring bones move geometry outside static bounds).
+  **Unified tick order (matters):** `mixer.update(dt)` → `updateLookAt()` →
+  `vrm.update(dt)` (ONE call drives springs+lookAt+expressions — never poke
+  managers directly) → `controls.update()` → render; `dt` clamped to
+  `MAX_DELTA_S` 0.1s so a resume/hitch can't explode the spring physics
+  (verified with a 1.2s main-thread hitch). **lookAt (inert in GLB mode):**
+  world-space `lookAtTarget` on a plane `LOOK_PLANE_DIST` 1.5m in front of the
+  head bone, `vrm.lookAt.target` set on load; window-level mousemove maps the
+  cursor with the AVATAR PANEL CENTER as the zero point, `LOOK_DEAD_ZONE_PX` 4,
+  damped `LOOK_DAMP` 0.1/frame, idle > `LOOK_IDLE_RETURN_MS` 5s eases back to
+  straight-ahead; rotation limits come from the FILE's authored lookAt ranges —
+  never hand-clamp. **Expressions seam:** `setExpression(name, weight)` /
+  `listExpressions()` (logged on VRM load — the future lip-sync phase maps
+  amplitude → 'aa').
+  **VRMA ANIMATIONS (VRM mode):** the real reika.vrm (72 MB; ⚠ FACING IS
+  PER-EXPORT — the first export rested -Z and needed `VRM_ROTATION_Y = π`,
+  the current one rests +Z and uses 0; check facing after every reimport)
+  ships NO baked clips; animation comes from 13 .vrma
+  files in `public/models/vrma/` (VRM Animation format), listed in the STATIC
+  `VRMA_MANIFEST` (⚠ update it when files change — no runtime dir listing),
+  loaded via `VRMAnimationLoaderPlugin` and RETARGETED per-model with
+  `createVRMAnimationClip` (@pixiv/three-vrm-animation) into ordinary mixer
+  clips. **Every new .vrma MUST go through `scripts/sanitize-vrma.mjs` first**:
+  these UniVRM exports strip the hips node (`humanBones.hips.node = -1`,
+  orphaned root-motion channels) — unpatched, the plugin crashes ("reading
+  'matrixWorld'"); patched with an identity node only, the retargeter's
+  height ratio divides by zero and the model teleports to Infinity, so the
+  sanitizer reconstructs a HipsRoot with rest transform from the first hips
+  keyframes. **Playback controller:** 'random' (default) wanders — LoopOnce +
+  mixer 'finished' → fresh random pick (never the same twice in a row);
+  'manual' (corner dropdown, `.anim-select`) plays the pick as LoopRepeat so
+  it HOLDS until the user changes it or returns to "🎲 Random". Celebrations
+  (`liveCompletionVersion`) play one-shot OVER either mode without touching
+  `currentName`, so 'finished' restores the right state. `fadeTo` is the one
+  fade primitive: 0.3s crossfades, `clampWhenFinished` everywhere (a finished
+  pose must hold through the next fade — never a T-pose pop), actions come
+  from mixer.clipAction's per-clip cache and stale ones are stop()ped
+  (≤2 active ever — leak-checked). Frame box gets +18% top headroom once
+  clips load (jump/stretch root motion must not crop). GLB fallback keeps the
+  old baked-idle path untouched (test.vrm has no clips and T-poses — expected).
 - Completion side effects (notification + sound) fire ONLY from the live tick,
   ONE per newly-completed block. Startup catch-up (`startupCatchUp`, gated
   before the live tick via `store.reconciled`) logs blocks that ended while

@@ -26,6 +26,11 @@ Without the env var the scripts fail at `http://127.0.0.1:9222/json`.
 | `inspect-db.cjs <path-to-db>` | Lists tables + activities + row counts via `node:sqlite` (read-only; safe while the app runs). DB lives at `%APPDATA%\com.chardoh.timeline\timeline.db`. |
 | `example-ui-test.mjs` | Worked example: reloads, picks a *visible, hit-testable* block, does a cross-lane drag, then a chip drop into a lane, asserting on resulting styles. Copy this pattern for new interaction tests. |
 | `sanitize-glb.mjs <file.glb>` | Fixes Unity glTFast exports whose nodes declare `skin` over meshes with no JOINTS_0/WEIGHTS_0 (three's `normalizeSkinWeights` crashes with "reading 'count'"). Strips the bogus skin refs in place. **Run on any re-exported avatar model before dropping it into `public/models/`.** |
+| `verify-vrm.mjs [glb\|vrm]` | Navigates the app to the default chain (`glb`) or the `?avatar=/models/test.vrm` dev override (`vrm`) and dumps the AvatarPanel mode/clips/expressions/spring-joint state. |
+| `verify-vrm-behavior.mjs` | Full VRM behavioral suite against test.vrm: mouse-tracked lookAt + 5s idle-return, spring-bone sway on model nudge, expression facade, delta-clamp hitch survival, orbit/home. |
+| `verify-profiles.mjs` | End-to-end profiles regression: boot identity, tab guards, switch-with-reload into Test, block completion isolated to Test's ledger, switch back, add "Zeta" via real key events, remove via ✕ (file deleted). Leaves scratch blocks in the Test profile (that's what it's for). |
+| `sanitize-vrma.mjs <files...>` | Fixes UniVRM .vrma exports whose hips bone was stripped (`humanBones.hips.node = -1` + orphaned root-motion channels → three-vrm-animation crashes / model at Infinity / facing issues). Appends a HipsRoot node with rest transform read from the first hips keyframes and rewires the channels. **Run on any new .vrma before dropping it into `public/models/vrma/`** (and add it to AvatarPanel's VRMA_MANIFEST). |
+| `verify-vrma.mjs` | VRMA pipeline suite: load/retarget of all manifest clips, random cycling with no immediate repeats, manual dropdown hold, lookAt during playback, action-leak check after rapid switching. |
 
 ## Hard-won gotchas
 

@@ -1,8 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as THREE from 'three';
-  import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+  import { GLTFLoader, type GLTF } from 'three/addons/loaders/GLTFLoader.js';
   import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { VRMLoaderPlugin, VRMUtils, type VRM } from '@pixiv/three-vrm';
+  import {
+    VRMAnimationLoaderPlugin,
+    createVRMAnimationClip,
+    type VRMAnimation,
+  } from '@pixiv/three-vrm-animation';
   import { store } from './store.svelte';
 
   /* ---- tuning ---------------------------------------------------------- */
@@ -33,7 +39,60 @@
   const FADE_S = 0.3;
   /** Clip-name fragments that count as a celebration, in preference order. */
   const CELEBRATE_NAMES = ['wave', 'dance', 'cheer', 'jump'];
-  const MODEL_URL = '/models/reika.glb';
+
+  /* ---- model loading (VRM-first chain) ----------------------------------- */
+  /** DEV override: force a specific model (also `?avatar=/models/test.vrm` in
+   *  the URL). Leave null for the production chain. */
+  const DEV_FORCE_MODEL: string | null = null;
+  /** Default chain: full VRM when the asset lands, glb until then. Dropping a
+   *  valid reika.vrm into public/models switches modes with ZERO code edits. */
+  const MODEL_CHAIN = ['/models/reika.vrm', '/models/reika.glb'];
+  /** Per-mode facing normalization. FACING IS PER-EXPORT, not per-format: the
+   *  first reika.vrm export rested facing -Z (needed Math.PI here); the
+   *  current one rests +Z like the spec (0). If an export comes in backwards,
+   *  this is the one knob to flip. */
+  const VRM_ROTATION_Y = 0;
+  const GLB_ROTATION_Y = 0;
+
+  /* ---- VRMA animations (VRM mode only) ------------------------------------ */
+  /** Where the VRM Animation files live (Vite static). */
+  const VRMA_DIR = '/models/vrma/';
+  /** STATIC MANIFEST of the copied .vrma files — the webview can't list a
+   *  directory at runtime. ⚠ UPDATE THIS LIST when files in public/models/vrma
+   *  change. Display names are derived by stripping the reika_KA_IdleNN_ prefix. */
+  const VRMA_MANIFEST = [
+    'reika_KA_Idle01_breathing.vrma',
+    'reika_KA_Idle05_Stretch.vrma',
+    'reika_KA_Idle06_JumpAround.vrma',
+    'reika_KA_Idle07_SpinningJump.vrma',
+    'reika_KA_Idle08_ComeUpWithAnIdea.vrma',
+    'reika_KA_Idle14_Dance02.vrma',
+    'reika_KA_Idle35_FingerSnap.vrma',
+    'reika_KA_Idle36_Yay.vrma',
+    'reika_KA_Idle37_Tsundere.vrma',
+    'reika_KA_Idle41_CuteShyPose.vrma',
+    'reika_KA_Idle44_GreetingBow.vrma',
+    'reika_KA_Idle47_Scaring.vrma',
+    'reika_KA_Idle90_HandsOnHipsConfident.vrma',
+  ];
+  const cleanVrmaName = (file: string) =>
+    file.replace(/^reika_KA_Idle\d+_/, '').replace(/\.vrma$/, '');
+  /** Longest dt ever fed to mixer/spring physics — a resume-from-background or
+   *  a long frame hitch must not make the hair/skirt explode. */
+  const MAX_DELTA_S = 0.1;
+
+  /* ---- lookAt: head follows the mouse (VRM mode only) -------------------- */
+  /** Mouse moves smaller than this are ignored (no micro-jitter). */
+  const LOOK_DEAD_ZONE_PX = 4;
+  /** Target damping: fraction of remaining distance per frame. */
+  const LOOK_DAMP = 0.1;
+  /** Mouse idle for this long -> gaze eases back to straight ahead. */
+  const LOOK_IDLE_RETURN_MS = 5000;
+  /** Virtual gaze plane this far in front of her face (m). */
+  const LOOK_PLANE_DIST = 1.5;
+  /** Lateral/vertical target travel (m) across the full window span. */
+  const LOOK_SPAN_X = 1.2;
+  const LOOK_SPAN_Y = 0.8;
 
   /** Load failed → muted placeholder instead of the canvas. Never throws. */
   let failed = $state(false);
@@ -45,6 +104,8 @@
   let renderer: THREE.WebGLRenderer | null = null;
   let scene: THREE.Scene;
   let camera: THREE.PerspectiveCamera;
+  /** Non-null exactly when a .vrm loaded — everything downstream branches on it. */
+  let vrm: VRM | null = null;
   let mixer: THREE.AnimationMixer | null = null;
   let clips: THREE.AnimationClip[] = [];
   let idleAction: THREE.AnimationAction | null = null;
@@ -55,6 +116,58 @@
   /** True once the user orbits/zooms — they own the camera; resize then only
    *  updates aspect (no snap-back). Cleared by the double-click home reset. */
   let userAdjusted = false;
+
+  /* ---- lookAt state (world-space target; inert without vrm.lookAt) ------- */
+  const lookAtTarget = new THREE.Object3D();
+  /** Where the damped target is heading (mapped mouse point or straight-ahead). */
+  const lookGoal = new THREE.Vector3();
+  /** Straight-ahead resting point (head + LOOK_PLANE_DIST on +Z). */
+  const lookAhead = new THREE.Vector3();
+  const headPos = new THREE.Vector3();
+  let lastMouseX = NaN;
+  let lastMouseY = NaN;
+  let lastMouseMoveAt = 0;
+
+  /** Window-level mouse -> gaze goal on a virtual plane in front of her face.
+   *  The AVATAR PANEL's center is the zero point (cursor over her = straight
+   *  ahead), so directions read correctly wherever the panel sits on screen. */
+  function onGlobalMouseMove(e: MouseEvent) {
+    if (!vrm?.lookAt) return; // inert in GLB mode
+    const moved = Math.hypot(e.clientX - lastMouseX, e.clientY - lastMouseY);
+    if (moved < LOOK_DEAD_ZONE_PX) return; // dead zone: ignore micro-moves
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    lastMouseMoveAt = performance.now();
+    const pr = container.getBoundingClientRect();
+    const nx = (e.clientX - (pr.left + pr.width / 2)) / window.innerWidth;
+    const ny = (e.clientY - (pr.top + pr.height / 2)) / window.innerHeight;
+    lookGoal.set(
+      headPos.x + nx * 2 * LOOK_SPAN_X,
+      headPos.y - ny * 2 * LOOK_SPAN_Y,
+      headPos.z + LOOK_PLANE_DIST,
+    );
+  }
+
+  /** Per-frame gaze update: idle >5s eases the goal home; the lerp IS the
+   *  ease/damping. The VRM's own authored lookAt ranges clamp head/eye
+   *  rotation — never hand-clamp here. */
+  function updateLookAt() {
+    if (!vrm?.lookAt) return;
+    if (performance.now() - lastMouseMoveAt > LOOK_IDLE_RETURN_MS) {
+      lookGoal.copy(lookAhead);
+    }
+    lookAtTarget.position.lerp(lookGoal, LOOK_DAMP);
+  }
+
+  /* ---- expressions facade (the seam for future lip-sync / emotes) -------- */
+  /** Set a VRM expression weight (0..1). No-op in GLB mode / unknown names. */
+  export function setExpression(name: string, weight: number) {
+    vrm?.expressionManager?.setValue(name, weight);
+  }
+  /** Names the loaded VRM actually exposes (empty in GLB mode). */
+  export function listExpressions(): string[] {
+    return vrm?.expressionManager?.expressions.map((e) => e.expressionName) ?? [];
+  }
   const timer = new THREE.Timer(); // Clock is deprecated in three r185
   let raf = 0;
   let running = false;
@@ -121,7 +234,15 @@
     const loop = () => {
       if (!running) return;
       timer.update();
-      mixer?.update(timer.getDelta());
+      // Clamp dt: a hitch (or any resume path that slips past timer.reset)
+      // must never feed a huge step into the spring-bone physics.
+      const delta = Math.min(timer.getDelta(), MAX_DELTA_S);
+      // Order matters: animation pose first, THEN vrm.update layers spring
+      // bones / lookAt / expressions on top of it (one call drives all three
+      // — never poke springBoneManager & co. individually).
+      mixer?.update(delta);
+      updateLookAt();
+      vrm?.update(delta);
       controls?.update(); // damping needs a per-frame update
       renderer!.render(scene, camera);
       raf = requestAnimationFrame(loop);
@@ -134,27 +255,140 @@
     cancelAnimationFrame(raf);
   }
 
-  /** Crossfade to a clip by name. loop=false plays once (clamped) and then
-   *  crossfades back to idle via the mixer's 'finished' event. */
-  export function playClip(name: string, { loop = true } = {}) {
-    if (!mixer) return;
-    const clip = THREE.AnimationClip.findByName(clips, name)
-      ?? clips.find((c) => c.name.toLowerCase() === name.toLowerCase());
-    if (!clip) {
-      console.warn(`AvatarPanel: no clip named "${name}"`);
-      return;
+  /* ---- playback controller (ONE place owns what's playing) ---------------- */
+  /** 'random' = wander through the VRMA registry indefinitely; 'manual' =
+   *  hold on the dropdown-selected clip until the user changes it. */
+  let playMode: 'random' | 'manual' = 'random';
+  /** The controller's selection (dropdown pick in manual, last random pick in
+   *  random). A celebrate() one-shot plays OVER this without changing it, so
+   *  the 'finished' handler can restore the right state afterwards. */
+  let currentName = '';
+  /** Loaded VRMA names (drives the dropdown; empty in GLB mode). */
+  let animNames = $state<string[]>([]);
+  /** Dropdown model: '__random' or a clip name. */
+  let selectValue = $state('__random');
+  /** Every action we ever started, so stale ones can be stop()ped — the mixer
+   *  never accumulates live zero-weight actions across many switches. */
+  const touchedActions = new Set<THREE.AnimationAction>();
+
+  const findClip = (name: string) =>
+    THREE.AnimationClip.findByName(clips, name) ??
+    clips.find((c) => c.name.toLowerCase() === name.toLowerCase());
+
+  /**
+   * Load every manifest .vrma (VRM Animation format — NOT baked glTF clips)
+   * and RETARGET each onto the loaded model via createVRMAnimationClip, giving
+   * ordinary THREE.AnimationClips for the existing mixer. Faults are per-file:
+   * one bad vrma is skipped, the rest still load. Kicks off RANDOM mode.
+   */
+  async function loadVrmaClips(model: VRM) {
+    const l = new GLTFLoader();
+    l.register((parser) => new VRMAnimationLoaderPlugin(parser));
+    const results = await Promise.all(
+      VRMA_MANIFEST.map(async (file) => {
+        try {
+          const gltf = await l.loadAsync(VRMA_DIR + file);
+          const anim = (gltf.userData.vrmAnimations as VRMAnimation[] | undefined)?.[0];
+          if (!anim) throw new Error('file has no VRMC_vrm_animation payload');
+          const clip = createVRMAnimationClip(anim, model);
+          clip.name = cleanVrmaName(file);
+          return clip;
+        } catch (e) {
+          console.warn(`AvatarPanel: vrma failed (${file})`, e);
+          return null;
+        }
+      }),
+    );
+    if (destroyed) return;
+    clips = results
+      .filter((c): c is THREE.AnimationClip => c !== null)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    animNames = clips.map((c) => c.name);
+    console.info('AvatarPanel VRMA animations:', animNames.length ? animNames : '(none)');
+    if (animNames.length) {
+      // The frame box was measured at bind pose; jump/stretch clips carry real
+      // root motion above it. Add headroom so animated apexes don't crop.
+      if (frameBox) {
+        const h = frameBox.max.y - frameBox.min.y;
+        frameBox.max.y += h * 0.18;
+        if (!userAdjusted) goHome();
+      }
+      playRandom(); // default behavior: wander forever
     }
+  }
+
+  /**
+   * The single fade primitive. clampWhenFinished on EVERYTHING: a finished
+   * LoopOnce action must hold its last frame so the next crossfade blends from
+   * a pose, never from a T-pose snap. Actions come from mixer.clipAction (one
+   * cached action per clip — reused, not respawned); anything that is neither
+   * the incoming nor the outgoing action gets stop()ped here.
+   */
+  function fadeTo(clip: THREE.AnimationClip, { loop = false } = {}) {
+    if (!mixer) return;
     const next = mixer.clipAction(clip);
-    if (next === currentAction) return;
+    for (const a of touchedActions) {
+      if (a !== next && a !== currentAction) a.stop();
+    }
+    touchedActions.add(next);
     next.reset();
     next.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, Infinity);
-    next.clampWhenFinished = !loop;
-    if (currentAction) next.crossFadeFrom(currentAction, FADE_S, false);
+    next.clampWhenFinished = true;
+    if (currentAction && currentAction !== next) {
+      next.crossFadeFrom(currentAction, FADE_S, false);
+    }
     next.play();
     currentAction = next;
   }
 
-  /** Crossfade back to the looping idle clip. */
+  /** RANDOM mode step: a fresh random clip (never the one that just played,
+   *  when >1 exists), LoopOnce — 'finished' brings us back here forever. */
+  function playRandom() {
+    const pool = clips.filter((c) => clips.length <= 1 || c.name !== currentName);
+    const clip = pool[Math.floor(Math.random() * pool.length)];
+    if (!clip) return;
+    currentName = clip.name;
+    fadeTo(clip, { loop: false });
+  }
+
+  /** MANUAL mode: play the chosen clip LOOPING — it holds by construction
+   *  (never fires 'finished'), until the user picks again or returns to
+   *  Random. Exported as the public "play this" seam. */
+  export function playClip(name: string) {
+    const clip = findClip(name);
+    if (!clip) {
+      console.warn(`AvatarPanel: no clip named "${name}"`);
+      return;
+    }
+    playMode = 'manual';
+    currentName = name;
+    selectValue = name;
+    fadeTo(clip, { loop: true });
+  }
+
+  function setRandomMode() {
+    playMode = 'random';
+    selectValue = '__random';
+    playRandom();
+  }
+
+  /** Mixer 'finished': random -> next random pick; manual -> restore the held
+   *  selection (only reachable there after a celebrate one-shot); GLB mode ->
+   *  legacy return-to-idle. Celebrations therefore never trap either mode. */
+  function onClipFinished() {
+    if (vrm && animNames.length) {
+      if (playMode === 'manual') {
+        const held = findClip(currentName);
+        if (held) fadeTo(held, { loop: true });
+      } else {
+        playRandom();
+      }
+    } else {
+      returnToIdle();
+    }
+  }
+
+  /** GLB-fallback only: crossfade back to the looping baked idle clip. */
   export function returnToIdle() {
     if (!mixer || !idleAction || currentAction === idleAction) return;
     idleAction.reset();
@@ -164,13 +398,14 @@
     currentAction = idleAction;
   }
 
-  /** Play the first celebration-ish clip once, if the export has one. */
+  /** Play the first celebration-ish clip ONCE over the current mode; the
+   *  'finished' handler restores that mode (does NOT touch currentName). */
   function celebrate() {
     if (!mixer) return;
     for (const frag of CELEBRATE_NAMES) {
       const clip = clips.find((c) => c.name.toLowerCase().includes(frag));
       if (clip) {
-        playClip(clip.name, { loop: false });
+        fadeTo(clip, { loop: false });
         return;
       }
     }
@@ -223,73 +458,139 @@
       key.position.set(0.6, 1.4, 1.2); // slightly above and in front
       scene.add(key);
 
-      new GLTFLoader().load(
-        MODEL_URL,
-        (gltf) => {
-          if (destroyed) return;
-          // NOTE: orientation is export-dependent (the old glTFast export faced
-          // away; the current UnityGltf one faces +Z, toward the camera). If a
-          // future export comes in backwards, set rotation.y = Math.PI here.
-          scene.add(gltf.scene);
+      /** Shared post-load path for BOTH modes — everything branches on `vrm`. */
+      const onModelLoaded = (gltf: GLTF, url: string) => {
+        vrm = (gltf.userData.vrm as VRM | undefined) ?? null;
+        const root = vrm ? vrm.scene : gltf.scene;
 
+        if (vrm) {
+          // Perf passes (current three-vrm API; combineSkeletons superseded
+          // removeUnnecessaryJoints in 3.x).
+          VRMUtils.removeUnnecessaryVertices(gltf.scene);
+          VRMUtils.combineSkeletons(gltf.scene);
+          // VRM 0.x faces -Z; rotate to the VRM 1.0 +Z convention so BOTH
+          // spec versions end up facing the home camera.
+          if (vrm.meta?.metaVersion === '0') VRMUtils.rotateVRM0(vrm);
+          root.rotation.y = VRM_ROTATION_Y;
+          // Spring bones move meshes outside their static bounds — standard
+          // three-vrm practice is to disable frustum culling on the model.
+          root.traverse((o) => {
+            if ((o as THREE.Mesh).isMesh) o.frustumCulled = false;
+          });
+          console.info(
+            `AvatarPanel: VRM mode (${url}, spec ${vrm.meta?.metaVersion ?? '?'})`,
+          );
+          console.info(
+            'AvatarPanel expressions:',
+            listExpressions().length ? listExpressions() : '(none)',
+          );
+        } else {
+          root.rotation.y = GLB_ROTATION_Y;
+          console.info(`AvatarPanel: GLB fallback mode (${url})`);
+        }
+        scene.add(root);
+
+        if (vrm) {
+          // VRM mode animates via RETARGETED VRMA files, not baked glTF clips
+          // (reika.vrm ships none). The mixer binds the retargeted tracks to
+          // the normalized humanoid rig nodes inside vrm.scene.
+          mixer = new THREE.AnimationMixer(root);
+          mixer.addEventListener('finished', onClipFinished);
+          void loadVrmaClips(vrm); // async; kicks off random mode when done
+        } else {
           clips = gltf.animations;
           console.info(
             'AvatarPanel clips:',
             clips.length ? clips.map((c) => c.name) : '(none)',
           );
           if (clips.length) {
-            mixer = new THREE.AnimationMixer(gltf.scene);
+            mixer = new THREE.AnimationMixer(root);
             const idle =
               clips.find((c) => c.name.toLowerCase() === 'idle') ??
               clips.find((c) => c.name.toLowerCase().includes('idle')) ??
               clips[0];
             idleAction = mixer.clipAction(idle);
+            touchedActions.add(idleAction);
             idleAction.setLoop(THREE.LoopRepeat, Infinity);
             idleAction.play();
             currentAction = idleAction;
             // One-shot clips (celebrations) hand control back to idle.
-            mixer.addEventListener('finished', () => returnToIdle());
+            mixer.addEventListener('finished', onClipFinished);
             // Pose frame 0 BEFORE framing: Unity exports can bind the mesh far
             // off-origin while the animation snaps the skeleton to the origin —
             // framing the bind pose would aim the camera at empty space.
             mixer.update(0);
           }
-          gltf.scene.updateMatrixWorld(true);
+        }
+        root.updateMatrixWorld(true);
 
-          // Frame on BONE world positions when the model is rigged (the
-          // animated-pose truth — Box3.setFromObject ignores skinning and
-          // reports bind-space bounds). Bones sit slightly inside the
-          // silhouette, so pad by a few % of the height — just enough for
-          // flesh/hair, NOT a safety factor that pushes the camera away.
-          const boneBox = new THREE.Box3();
-          let boneCount = 0;
-          gltf.scene.traverse((o) => {
-            if ((o as THREE.Bone).isBone) {
-              boneBox.expandByPoint(o.getWorldPosition(new THREE.Vector3()));
-              boneCount++;
-            }
-          });
-          if (boneCount > 0) {
-            const h = boneBox.max.y - boneBox.min.y;
-            boneBox.expandByScalar(h * 0.05);
-            frameBox = boneBox;
-          } else {
-            frameBox = new THREE.Box3().setFromObject(gltf.scene);
+        // Frame on BONE world positions when the model is rigged (the
+        // animated-pose truth — Box3.setFromObject ignores skinning and
+        // reports bind-space bounds). Bones sit slightly inside the
+        // silhouette, so pad by a few % of the height — just enough for
+        // flesh/hair, NOT a safety factor that pushes the camera away.
+        const boneBox = new THREE.Box3();
+        let boneCount = 0;
+        root.traverse((o) => {
+          if ((o as THREE.Bone).isBone) {
+            boneBox.expandByPoint(o.getWorldPosition(new THREE.Vector3()));
+            boneCount++;
           }
-          // Home view: frame + hand target/clamps to the controls + render.
-          goHome();
-        },
-        undefined,
-        (err) => {
-          console.warn(
-            `AvatarPanel: could not load ${MODEL_URL} — showing placeholder. ` +
-              'Is public/models/reika.glb present?',
-            err,
-          );
-          failed = true;
-          stop();
-        },
-      );
+        });
+        if (boneCount > 0) {
+          const h = boneBox.max.y - boneBox.min.y;
+          boneBox.expandByScalar(h * 0.05);
+          frameBox = boneBox;
+        } else {
+          frameBox = new THREE.Box3().setFromObject(root);
+        }
+
+        // lookAt hookup (VRM only; the framework no-ops cleanly without it).
+        // World-space target on a plane in front of her face; the humanoid
+        // head bone anchors the plane, the frame box approximates if absent.
+        if (vrm?.lookAt) {
+          const head = vrm.humanoid?.getNormalizedBoneNode('head');
+          if (head) head.getWorldPosition(headPos);
+          else frameBox.getCenter(headPos).setY(frameBox.max.y * 0.9);
+          lookAhead.set(headPos.x, headPos.y, headPos.z + LOOK_PLANE_DIST);
+          lookGoal.copy(lookAhead);
+          lookAtTarget.position.copy(lookAhead);
+          scene.add(lookAtTarget);
+          vrm.lookAt.target = lookAtTarget;
+        }
+
+        // Home view: frame + hand target/clamps to the controls + render.
+        goHome();
+      };
+
+      // ONE loader handles both formats: the VRM plugin only activates on
+      // files carrying the VRM extensions; plain glb parses as before.
+      const loader = new GLTFLoader();
+      loader.register((parser) => new VRMLoaderPlugin(parser));
+      // DEV: `?avatar=/models/test.vrm` (or DEV_FORCE_MODEL) pins one model.
+      const forced = import.meta.env.DEV
+        ? (new URLSearchParams(location.search).get('avatar') ?? DEV_FORCE_MODEL)
+        : null;
+      const chain = forced ? [forced] : MODEL_CHAIN;
+      (async () => {
+        for (const url of chain) {
+          try {
+            const gltf = await loader.loadAsync(url);
+            if (!destroyed) onModelLoaded(gltf, url);
+            return;
+          } catch (e) {
+            console.info(
+              `AvatarPanel: ${url} unavailable — trying next.`,
+              e instanceof Error ? e.message : e,
+            );
+          }
+        }
+        console.warn(
+          `AvatarPanel: no model loaded (tried ${chain.join(', ')}) — showing placeholder.`,
+        );
+        failed = true;
+        stop();
+      })();
 
       // Panel is user-resizable. Per observer event (every mousemove of a
       // splitter drag): buffer size + aspect + ONE SYNCHRONOUS RENDER in the
@@ -336,6 +637,18 @@
           dist: () => controls && camera.position.distanceTo(controls.target),
           clamps: () => controls && [controls.minDistance, controls.maxDistance],
           userAdjusted: () => userAdjusted,
+          mode: () => (vrm ? 'vrm' : 'glb'),
+          expressions: () => listExpressions(),
+          springJoints: () => vrm?.springBoneManager?.joints.size ?? 0,
+          lookTarget: () => lookAtTarget.position.toArray(),
+          lookGoal: () => lookGoal.toArray(),
+          setExpression,
+          /** Raw handle for dev probing (nudge the scene, poke managers). */
+          vrmRef: () => vrm,
+          anims: () => animNames,
+          playState: () => ({ mode: playMode, current: currentName }),
+          activeActions: () =>
+            [...touchedActions].filter((a) => a.isRunning()).length,
         };
       }
       // Wheel containment: OrbitControls preventDefaults the dolly, but the
@@ -357,17 +670,23 @@
       else if (!failed) start();
     };
     document.addEventListener('visibilitychange', onVisibility);
+    // GLOBAL mouse tracking (whole app window, not just the panel) so she
+    // watches the cursor while the user works in the timeline. Inert in GLB
+    // mode (the handler bails without vrm.lookAt).
+    window.addEventListener('mousemove', onGlobalMouseMove);
 
     return () => {
       destroyed = true;
       stop();
       clearTimeout(reframeTimer);
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('mousemove', onGlobalMouseMove);
       canvas.removeEventListener('dblclick', goHome);
       canvas.removeEventListener('wheel', stopWheel);
       controls?.dispose(); // detaches its canvas listeners
       controls = null;
       ro?.disconnect();
+      vrm = null; // colliders/joints are freed with the scene traverse below
       mixer?.stopAllAction();
       // Dispose everything we allocated: geometries, materials, their textures,
       // then the GL context. The panel lives all day — no leaks allowed.
@@ -400,6 +719,24 @@
   {#if failed}
     <div class="unavailable">avatar unavailable</div>
   {/if}
+  <!-- Dev/test affordance: pick an animation (manual mode, holds) or Random.
+       Its own small pointer-events island in the corner — the rest of the
+       canvas keeps orbit-drag. -->
+  {#if animNames.length}
+    <select
+      class="anim-select"
+      bind:value={selectValue}
+      onchange={() => {
+        if (selectValue === '__random') setRandomMode();
+        else playClip(selectValue);
+      }}
+    >
+      <option value="__random">🎲 Random (default)</option>
+      {#each animNames as n (n)}
+        <option value={n}>{n}</option>
+      {/each}
+    </select>
+  {/if}
 </div>
 
 <style>
@@ -429,5 +766,23 @@
     place-items: center;
     color: #6f6f6f;
     font-size: 0.9rem;
+  }
+
+  .anim-select {
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    max-width: 45%;
+    background: rgba(30, 30, 30, 0.85);
+    color: #cfcfcf;
+    border: 1px solid #3a3a3a;
+    border-radius: 5px;
+    font-size: 0.72rem;
+    padding: 0.2rem 0.35rem;
+    z-index: 3;
+  }
+  .anim-select:focus {
+    outline: none;
+    border-color: #3b6ea5;
   }
 </style>
